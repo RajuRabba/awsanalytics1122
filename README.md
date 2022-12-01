@@ -24,7 +24,7 @@
 | 9          | EMR Architecture                                    |
 | 9          | Introduction to QuickSight                          |
 | 10         | EMR Sample Project                                  |
-| 10         | Placeholder for any other items                    |
+| 10         | Docker Image with Lambda Functions                  |
 | 10         | Lambda Layers for custom languages/Packages         |
 | 11         | MSK Introduction and Use Cases                      |
 | 11         | Introduction to Glue Databrew                       |
