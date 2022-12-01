@@ -1,0 +1,434 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Lake Formation tutorial for a simple governed table
+
+Parameters:
+  DatalakeAdminUserName:
+    Type: String
+    Description: IAM user name to be created for data lake admin.
+    Default: DatalakeAdmin1
+    AllowedPattern: '[\w+=,.@-]+'
+    MinLength: '1'
+    MaxLength: '64'
+    ConstraintDescription: the user name must be between 1 and 64 characters
+  DatalakeAdminUserPassword:
+    Type: String
+    Description: IAM user console password for data lake admin.
+    NoEcho: 'true'
+    AllowedPattern: '[\u0009\u000A\u000D\u0020-\u00FF]+'
+    MinLength: '1'
+    MaxLength: '128'
+    ConstraintDescription: the password must be between 1 and 128 characters
+  DataAnalystUserName:
+    Type: String
+    Description: IAM user name to be created for data analyst.
+    Default: DataAnalyst1
+    AllowedPattern: '[\w+=,.@-]+'
+    MinLength: '1'
+    MaxLength: '64'
+    ConstraintDescription: the user name must be between 1 and 64 characters
+  DataAnalystUserPassword:
+    Type: String
+    Description: IAM user console password for data analyst.
+    NoEcho: 'true'
+    AllowedPattern: '[\u0009\u000A\u000D\u0020-\u00FF]+'
+    MinLength: '1'
+    MaxLength: '128'
+    ConstraintDescription: the password must be between 1 and 128 characters
+  DatabaseName:
+    Type: String
+    Description: Lake Formation database name to be created to store a governed table.
+    Default: lakeformation_tutorial_amazon_reviews
+  DataLakeBucketName:
+    Type: String
+    Description: S3 bucket name to be created to store data for data lake. The name needs to be globally unique.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: IAM User Configuration
+        Parameters:
+          - DatalakeAdminUserName
+          - DatalakeAdminUserPassword
+          - DataAnalystUserName
+          - DataAnalystUserPassword
+      -
+        Label:
+          default: Data Lake Configuration
+        Parameters:
+          - DataLakeBucketName
+          - DatabaseName
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${DataLakeBucketName}
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+
+  S3CustomResource1:
+      Type: Custom::S3CustomResource1
+      Properties:
+        ServiceToken: !GetAtt AWSLambdaFunction.Arn
+        dest_bucket: !Sub ${DataLakeBucketName}
+        dest_key: 'parquet/product_category=Camera/part-00004-495c48e6-96d6-4650-aa65-3c36a3516ddd.c000.snappy.parquet'
+        src_bucket: 'amazon-reviews-pds'
+        src_key: 'parquet/product_category=Camera/part-00004-495c48e6-96d6-4650-aa65-3c36a3516ddd.c000.snappy.parquet'
+      DependsOn:
+        - AWSLambdaFunction
+        - S3Bucket
+
+  S3CustomResource2:
+      Type: Custom::S3CustomResource2
+      Properties:
+        ServiceToken: !GetAtt AWSLambdaFunction.Arn
+        dest_bucket: !Sub ${DataLakeBucketName}
+        dest_key: 'parquet/product_category=Books/part-00000-495c48e6-96d6-4650-aa65-3c36a3516ddd.c000.snappy.parquet'
+        src_bucket: 'amazon-reviews-pds'
+        src_key: 'parquet/product_category=Books/part-00000-495c48e6-96d6-4650-aa65-3c36a3516ddd.c000.snappy.parquet'
+      DependsOn:
+        - AWSLambdaFunction
+        - S3Bucket
+
+  AWSLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Description: "Custom resource for S3"
+      FunctionName: !Sub 'lambda-custom-resource-${AWS::StackName}'
+      Handler: index.handler
+      Role: !GetAtt AWSLambdaExecutionRole.Arn
+      Timeout: 360
+      Runtime: python3.8
+      Code:
+        ZipFile: !Sub
+          - |
+            import boto3
+            from botocore.client import ClientError
+            import cfnresponse
+            def create_s3_bucket_if_needed(s3_client, bucket_name, region):
+                location = {'LocationConstraint': region}
+                try:
+                    s3_client.head_bucket(Bucket=bucket_name)
+                    print(f"S3 Bucket already exists: {bucket_name}")
+                except ClientError as ce1:
+                    if ce1.response['Error']['Code'] == "404": # bucket not found
+                        print(f"Creating S3 bucket: {bucket_name}")
+                        try:
+                            if region == "us-east-1":
+                                bucket = s3_client.create_bucket(Bucket=bucket_name)
+                            else:
+                                bucket = s3_client.create_bucket(Bucket=bucket_name, CreateBucketConfiguration=location)
+                            print(f"Created S3 bucket: {bucket_name}")
+                        except ClientError as ce2:
+                            print(f"Unexpected error occurred when creating S3 bucket: {bucket_name}, exception: {ce2}")
+                            raise
+                        except:
+                            print(f"Unexpected error occurred when creating S3 bucket: {bucket_name}")
+                            raise
+                    else:
+                        print(f"Unexpected error occurred when heading S3 bucket: {bucket_name}, exception: {ce1}")
+                        raise
+                except:
+                    print(f"Unexpected error occurred when heading S3 bucket: {bucket_name}")
+                    raise
+            def handler(event, context):
+                # Init
+                the_event = event['RequestType'].strip()
+                print("The event is: ", the_event)
+                response_data = {}
+                s3 = boto3.client('s3')
+                # Retrieve parameters
+                dest_bucket = event['ResourceProperties']['dest_bucket'].strip()
+                dest_key = event['ResourceProperties']['dest_key'].strip()
+                src_bucket = event['ResourceProperties']['src_bucket'].strip()
+                src_key = event['ResourceProperties']['src_key'].strip()
+                try:
+                    if the_event in ('Create', 'Update'):
+                        # Creating script bucket
+                        create_s3_bucket_if_needed(s3, dest_bucket, '${Region}')
+                        # Creating script file
+                        try:
+                          copy_source = {'Bucket': src_bucket, 'Key': src_key}
+                          s3.copy_object(CopySource=copy_source, Bucket=dest_bucket, Key=dest_key)
+                        except ClientError as ce:
+                            print("Failed to copy the source code file.")
+                            print(ce)
+                            print(ce.response['ResponseMetadata'])
+                        # Creating temp bucket
+                    elif the_event == 'Delete':
+                        # Do nothing
+                        print("Nothing is being done for Delete")
+                    # Everything OK... send the signal back
+                    print("Completed.")
+                    cfnresponse.send(event,
+                                      context,
+                                      cfnresponse.SUCCESS,
+                                      response_data)
+                except Exception as e:
+                    print("Failed...")
+                    print(e)
+                    response_data['Data'] = str(e)
+                    cfnresponse.send(event,
+                                      context,
+                                      cfnresponse.FAILED,
+                                      response_data)
+          - Region: !Ref AWS::Region
+  AWSLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub AWSLambdaExecutionRole-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action:
+          - sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+        Version: '2012-10-17'
+      Path: "/"
+      Policies:
+      - PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Effect: Allow
+            Resource: arn:aws:logs:*:*:*
+        PolicyName: !Sub AWSLambda-CW-${AWS::StackName}
+      - PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          -
+            Effect: "Allow"
+            Action:
+              - s3:GetObject
+            Resource: 
+              - !Sub arn:aws:s3:::aws-bigdata-blog/*
+              - !Sub arn:aws:s3:::${DataLakeBucketName}/*
+              - !Sub arn:aws:s3:::amazon-reviews-pds/*
+          -
+            Effect: "Allow"
+            Action:
+              - s3:PutObject
+            Resource: 
+              - !Sub arn:aws:s3:::aws-glue-scripts-${AWS::AccountId}-${AWS::Region}/*
+              - !Sub arn:aws:s3:::aws-glue-temporary-${AWS::AccountId}-${AWS::Region}/*
+              - !Sub arn:aws:s3:::${DataLakeBucketName}/*
+          -
+            Effect: "Allow"
+            Action:
+              - s3:CreateBucket
+              - s3:ListBucket
+            Resource: 
+              - !Sub arn:aws:s3:::aws-glue-scripts-${AWS::AccountId}-${AWS::Region}
+              - !Sub arn:aws:s3:::aws-glue-temporary-${AWS::AccountId}-${AWS::Region}
+              - !Sub arn:aws:s3:::aws-bigdata-blog
+              - !Sub arn:aws:s3:::amazon-reviews-pds
+              - !Sub arn:aws:s3:::${DataLakeBucketName}
+        PolicyName: !Sub AWSLambda-S3-${AWS::StackName}
+
+
+  LFRegisterLocationServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lakeformation.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      RoleName: !Sub LFRegisterLocationServiceRole-${AWS::StackName}
+      Path: /
+
+  S3DataLakePolicy:
+    DependsOn: LFRegisterLocationServiceRole
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub S3DataLakePolicy-${AWS::StackName}
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource: !Sub arn:aws:s3:::${DataLakeBucketName}/*
+          -
+            Effect: "Allow"
+            Action:
+              - s3:ListBucket
+            Resource: !Sub arn:aws:s3:::${DataLakeBucketName}
+      Roles: 
+        - !Ref LFRegisterLocationServiceRole
+
+  LFQueryPolicy:
+    DependsOn:
+      - DatalakeAdminUser
+      - DataAnalystUser
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub LFQueryPolicy-${AWS::StackName}
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Action:
+              - lakeformation:StartTransaction
+              - lakeformation:CommitTransaction
+              - lakeformation:CancelTransaction
+              - lakeformation:ExtendTransaction
+              - lakeformation:StartQueryPlanning
+              - lakeformation:GetTableObjects
+              - lakeformation:GetQueryState
+              - lakeformation:GetWorkUnits
+              - lakeformation:GetWorkUnitResults
+            Resource: "*"
+      Users:
+        - !Ref DatalakeAdminUser
+        - !Ref DataAnalystUser
+
+  LFLocationPolicy:
+    DependsOn: LFRegisterLocationServiceRole
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub LFLocationPolicy-${AWS::StackName}
+      PolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Action:
+              - lakeformation:StartTransaction
+              - lakeformation:CommitTransaction
+              - lakeformation:CancelTransaction
+              - lakeformation:GetTableObjects
+              - lakeformation:UpdateTableObjects
+            Resource: "*"
+          -
+            Effect: "Allow"
+            Action:
+              - glue:GetDatabase
+              - glue:GetDatabases
+              - glue:GetTableVersions
+              - glue:GetPartitions
+              - glue:GetTable
+              - glue:GetTables
+              - glue:UpdateTable
+            Resource: "*"
+      Roles:
+        - !Ref LFRegisterLocationServiceRole
+
+  DatalakeAdminUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Ref DatalakeAdminUserName
+      LoginProfile:
+        Password: !Ref DatalakeAdminUserPassword
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLakeFormationDataAdmin
+        - arn:aws:iam::aws:policy/AmazonAthenaFullAccess
+        - arn:aws:iam::aws:policy/IAMReadOnlyAccess
+
+  DataAnalystUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Ref DataAnalystUserName
+      LoginProfile:
+        Password: !Ref DataAnalystUserPassword
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonAthenaFullAccess
+
+  LFDataLakeSettings:
+    DependsOn: DatalakeAdminUser
+    Type: AWS::LakeFormation::DataLakeSettings
+    Properties:
+      Admins:
+        - DataLakePrincipalIdentifier: !GetAtt 'DatalakeAdminUser.Arn'
+
+  LFDataLakeLocation:
+    DependsOn: LFRegisterLocationServiceRole
+    Type: AWS::LakeFormation::Resource
+    Properties: 
+      ResourceArn: !Sub arn:aws:s3:::${DataLakeBucketName}
+      RoleArn: !GetAtt 'LFRegisterLocationServiceRole.Arn'
+      UseServiceLinkedRole: false
+
+  LFDatabasePermissionForLFRegisterLocationServiceRole:
+    DependsOn:
+    - LakeFormationDatabase
+    - LFRegisterLocationServiceRole
+    Type: AWS::LakeFormation::Permissions
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt 'LFRegisterLocationServiceRole.Arn'
+      Permissions:
+        - ALTER
+        - CREATE_TABLE
+        - DESCRIBE
+        - DROP
+      Resource:
+        DatabaseResource:
+          Name: !Ref DatabaseName
+
+  LFDatabasePermissionForDataLakeAdminUser:
+    DependsOn:
+      - LakeFormationDatabase
+      - DatalakeAdminUser
+    Type: AWS::LakeFormation::Permissions
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt 'DatalakeAdminUser.Arn'
+      Permissions:
+        - ALL
+        - ALTER
+        - CREATE_TABLE
+        - DESCRIBE
+        - DROP
+      PermissionsWithGrantOption:
+        - ALL
+        - ALTER
+        - CREATE_TABLE
+        - DESCRIBE
+        - DROP
+      Resource:
+        DatabaseResource:
+          Name: !Ref DatabaseName
+
+  LFDatabasePermissionForDataAnalystUser:
+    DependsOn:
+      - LakeFormationDatabase
+      - DataAnalystUser
+    Type: AWS::LakeFormation::Permissions
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt 'DataAnalystUser.Arn'
+      Permissions:
+        - ALTER
+        - CREATE_TABLE
+        - DESCRIBE
+        - DROP
+      Resource:
+        DatabaseResource:
+          Name: !Ref DatabaseName
+
+  LakeFormationDatabase:
+    Type: AWS::Glue::Database
+    Properties: 
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput: 
+        Name: !Ref DatabaseName
+
